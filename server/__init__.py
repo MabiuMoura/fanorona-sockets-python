@@ -1,0 +1,2 @@
+"""Servidor autoritativo do Fanorona."""
+
