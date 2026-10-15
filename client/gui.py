@@ -10,18 +10,9 @@ from typing import Any
 
 from client.connection import ServerConnection
 from client.gui_model import BoardGeometry, ClientGameState
-from common.protocol import (
-    ASSIGN_PLAYER,
-    CHAT,
-    CONNECTED,
-    DISCONNECT,
-    ERROR,
-    GAME_OVER,
-    GIVEUP,
-    MOVE,
-    START,
-    STATE,
-)
+# These are local GUI event labels, not messages sent over the network.
+ASSIGN_PLAYER, CHAT, CONNECTED, DISCONNECT = "ASSIGN_PLAYER", "CHAT", "CONNECTED", "DISCONNECT"
+ERROR, GAME_OVER, START, STATE = "ERROR", "GAME_OVER", "START", "STATE"
 from game.board import Board, EMPTY, PLAYER_1, PLAYER_2
 
 
@@ -67,7 +58,7 @@ class FanoronaGUI:
         self.state = ClientGameState()
         self.connection: ServerConnection | None = None
         # app_events recebe o resultado da thread temporária de conexão.
-        # Mensagens TCP normais chegam em ServerConnection.events.
+        # Eventos locais produzidos pelas chamadas RPC chegam em ServerConnection.events.
         self.app_events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.selected: tuple[int, int] | None = None
         self.pending_move: dict[str, Any] | None = None
@@ -108,7 +99,7 @@ class FanoronaGUI:
         ).pack(pady=(5, 4))
         tk.Label(
             container,
-            text="Jogo distribuído por sockets TCP",
+            text="Jogo distribuído por chamadas remotas Pyro5",
             font=("Segoe UI", 10),
             fg=MUTED,
             bg=BG,
@@ -306,7 +297,7 @@ class FanoronaGUI:
     def process_queues(self) -> None:
         # ============================================================
         # INTEGRAÇÃO THREAD DE REDE -> TKINTER
-        # thread de rede -> recv() -> queue.Queue -> process_queues() -> widgets
+        # threads RPC -> queue.Queue -> process_queues() -> widgets
         #
         # Tkinter não é thread-safe. Por isso somente este método, executado na
         # thread principal via root.after(), encaminha eventos para a interface.
@@ -397,6 +388,13 @@ class FanoronaGUI:
             self.selected = None
         self.redraw_board()
         self.update_labels()
+        # Pyro5 retorna o estado atualizado; não há um evento GAME_OVER
+        # separado como havia no protocolo TCP. Convertemos o estado terminal
+        # em atualização visual na thread do Tkinter.
+        if self.state.game_over and not self.game_over_announced:
+            self.handle_game_over(
+                {"winner": self.state.winner, "reason": message.get("end_reason")}
+            )
 
     def update_labels(self) -> None:
         if not hasattr(self, "giveup_button"):
@@ -532,15 +530,9 @@ class FanoronaGUI:
         destination: tuple[int, int],
         capture: str | None = None,
     ) -> None:
-        message: dict[str, Any] = {
-            "type": MOVE,
-            "from": list(origin),
-            "to": list(destination),
-        }
-        if capture is not None:
-            message["capture"] = capture
-        self.pending_move = {"type": MOVE, "from": list(origin), "to": list(destination)}
-        if self.send(message):
+        self.pending_move = {"from": list(origin), "to": list(destination)}
+        if self.connection is not None:
+            self.connection.move(list(origin), list(destination), capture)
             self.request_pending = True
             self.status_var.set("Jogada enviada; aguardando o servidor...")
 
@@ -605,9 +597,8 @@ class FanoronaGUI:
         if self.pending_move is None:
             self.close_capture_dialog()
             return
-        message = dict(self.pending_move)
-        message["capture"] = capture
-        if self.send(message):
+        if self.connection is not None:
+            self.connection.move(self.pending_move["from"], self.pending_move["to"], capture)
             self.request_pending = True
             self.status_var.set("Escolha enviada; aguardando o servidor...")
         self.close_capture_dialog()
@@ -630,7 +621,8 @@ class FanoronaGUI:
         text = self.chat_entry.get().strip()
         if not text:
             return
-        if self.send({"type": CHAT, "message": text}):
+        if self.connection is not None:
+            self.connection.send_chat(text)
             self.chat_entry.delete(0, "end")
 
     def append_chat(self, text: str) -> None:
@@ -644,15 +636,16 @@ class FanoronaGUI:
     def confirm_give_up(self) -> None:
         # ============================================================
         # DESISTÊNCIA
-        # A confirmação envia GIVEUP, mas a GUI não declara o vencedor. Ela
-        # aguarda STATE/GAME_OVER produzidos pelo servidor autoritativo.
+        # A confirmação chama desistir() remotamente; a GUI aguarda o estado
+        # autoritativo devolvido por RPC para declarar o vencedor.
         # ============================================================
         if not self.state.started or self.state.game_over:
             return
         if messagebox.askyesno(
             "Desistir", "Deseja realmente desistir da partida?", parent=self.root
         ):
-            if self.send({"type": GIVEUP}):
+            if self.connection is not None:
+                self.connection.give_up()
                 self.status_var.set("Desistência enviada; aguardando o servidor...")
                 self.giveup_button.configure(state="disabled")
 
@@ -695,17 +688,6 @@ class FanoronaGUI:
             self.chat_entry.configure(state="disabled")
             self.chat_button.configure(state="disabled")
 
-    def send(self, message: dict[str, Any]) -> bool:
-        if self.connection is None:
-            self.status_var.set("Sem conexão com o servidor.")
-            return False
-        try:
-            self.connection.send(message)
-            return True
-        except (ConnectionError, OSError) as exc:
-            self.status_var.set(f"Falha ao enviar: {exc}")
-            return False
-
     def return_to_connection_screen(self) -> None:
         if self.connection is not None:
             self.connection.close()
@@ -721,8 +703,8 @@ class FanoronaGUI:
     def close(self) -> None:
         # ============================================================
         # ENCERRAMENTO
-        # Chamado pelo WM_DELETE_WINDOW: fecha o socket antes de destruir Tkinter.
-        # As threads são daemon e o fechamento desbloqueia recv().
+        # Chamado pelo WM_DELETE_WINDOW: encerra a sessão RPC antes de destruir
+        # o Tkinter. As threads auxiliares são daemon.
         # ============================================================
         if self.closing:
             return

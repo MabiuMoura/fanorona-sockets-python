@@ -1,2 +1,2 @@
-# O protótipo desta etapa usa somente a biblioteca padrão do Python.
+Pyro5>=5.15,<6
 

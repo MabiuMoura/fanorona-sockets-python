@@ -4,12 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-from typing import TYPE_CHECKING
-
 from game.board import Board, InvalidMove, MoveResult, Position
-
-if TYPE_CHECKING:
-    from server.client_handler import ClientHandler
 
 
 class SessionError(ValueError):
@@ -40,7 +35,8 @@ class GameSession:
     MAX_PLAYERS = 2
 
     def __init__(self) -> None:
-        self.players: dict[int, ClientHandler] = {}
+        # A sessão não conhece a camada de transporte (nem sockets, nem Pyro).
+        self.players: dict[int, str] = {}
         self.board = Board()
         self.current_player = 1
         self.game_started = False
@@ -48,11 +44,14 @@ class GameSession:
         self.winner: int | None = None
         self.end_reason: str | None = None
         self.capture_sequence: CaptureSequence | None = None
-        # ClientHandler P1 e P2 executam em threads distintas. O RLock protege
+        # Versão monotônica do estado público. Clientes usam este valor para
+        # descartar respostas RPC antigas que cheguem fora de ordem.
+        self.revision = 0
+        # Chamadas Pyro5 podem executar em threads distintas. O RLock protege
         # este estado compartilhado contra validações/alterações simultâneas.
         self.lock = threading.RLock()
 
-    def add_player(self, handler: ClientHandler) -> int:
+    def add_player(self, name: str = "") -> int:
         with self.lock:
             if self.game_started or len(self.players) >= self.MAX_PLAYERS:
                 raise RuntimeError("A partida já possui dois jogadores")
@@ -61,12 +60,14 @@ class GameSession:
                 for candidate in range(1, self.MAX_PLAYERS + 1)
                 if candidate not in self.players
             )
-            self.players[player_id] = handler
+            self.players[player_id] = name
+            self.revision += 1
             return player_id
 
     def remove_player(self, player_id: int) -> None:
         with self.lock:
-            self.players.pop(player_id, None)
+            if self.players.pop(player_id, None) is not None:
+                self.revision += 1
 
     def try_start(self) -> bool:
         """Inicia atomicamente quando os dois jogadores estão conectados."""
@@ -77,6 +78,7 @@ class GameSession:
                 return False
             self.game_started = True
             self.current_player = 1
+            self.revision += 1
             return True
 
     def has_player(self, player_id: int | None) -> bool:
@@ -139,6 +141,7 @@ class GameSession:
             else:
                 self.capture_sequence = None
                 self._change_turn(player_id)
+            self.revision += 1
             return self._state_unlocked(), result
 
     def _validate_active_game(self, player_id: int) -> None:
@@ -193,33 +196,37 @@ class GameSession:
             self.winner = Board.opponent(player_id)
             self.end_reason = "give_up"
             self.capture_sequence = None
+            self.revision += 1
             return self._state_unlocked()
 
     def disconnect(self, player_id: int) -> dict | None:
         """Remove o jogador e encerra somente se a partida estava em andamento."""
         with self.lock:
-            self.players.pop(player_id, None)
+            removed = self.players.pop(player_id, None)
             if not self.game_started or self.game_over:
+                if removed is not None:
+                    self.revision += 1
                 return None
             self.game_over = True
             self.winner = Board.opponent(player_id)
             self.end_reason = "disconnect"
             self.capture_sequence = None
+            self.revision += 1
             return self._state_unlocked()
 
     def _state_unlocked(self) -> dict:
-        # Somente tipos compatíveis com JSON saem da sessão. Objetos Board e
-        # CaptureSequence nunca são enviados diretamente pelo socket.
+        # Somente tipos simples e serializáveis pelo Pyro5 saem da sessão.
+        # Objetos Board e CaptureSequence nunca são retornados diretamente.
         sequence = self.capture_sequence
         return {
+            "revision": self.revision,
             "board": self.board.serialize(),
+            "game_started": self.game_started,
             "current_player": self.current_player,
             "game_over": self.game_over,
             "winner": int(self.winner) if self.winner is not None else None,
+            "end_reason": self.end_reason,
             "capture_sequence": sequence is not None,
             "active_piece": list(sequence.active_piece) if sequence else None,
         }
 
-    def handlers(self) -> list[ClientHandler]:
-        with self.lock:
-            return list(self.players.values())

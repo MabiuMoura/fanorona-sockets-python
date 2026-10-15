@@ -1,97 +1,102 @@
-"""Camada de conexão TCP independente da futura interface Tkinter."""
-
+"""Cliente Pyro5: chamadas RPC em threads, eventos locais para a interface."""
 from __future__ import annotations
-
 import queue
-import socket
 import threading
-from typing import Any
-
-from common.protocol import MessageBuffer, ProtocolError, send_message
-
+from typing import Any, Callable
+import Pyro5.api
 
 class ServerConnection:
-    """Recebe eventos em thread própria e os disponibiliza em uma fila."""
-
-    # Esta classe não conhece widgets. Ela converte a rede em uma fila de
-    # dicionários que tanto a GUI quanto o cliente de terminal podem consumir.
-
+    """Proxy Pyro5 por thread; Tkinter consome somente ``events`` na thread principal."""
     def __init__(self, host: str, port: int) -> None:
-        self.host = host
-        self.port = port
-        # Ponte thread-safe entre a thread receptora e a thread do Tkinter.
+        self.host, self.port = host, port
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
-        self._socket: socket.socket | None = None
-        self._send_lock = threading.Lock()
-        self._receiver: threading.Thread | None = None
+        self.player_id: int | None = None
+        self.session_token: str | None = None
         self._closed = threading.Event()
+        self._last_message = 0
+        self._last_state: dict | None = None
+        self._last_revision = -1
+        self._started_seen = False
+        self._state_lock = threading.Lock()
+
+    def _proxy(self) -> Pyro5.api.Proxy:
+        return Pyro5.api.Proxy(f"PYRO:fanorona@{self.host}:{self.port}")
 
     def connect(self, timeout: float = 5.0) -> None:
-        # ============================================================
-        # CRIAÇÃO DO SOCKET CLIENTE
-        # socket(AF_INET, SOCK_STREAM) cria um socket IPv4/TCP.
-        # connect() inicia a conexão com host e porta do servidor.
-        # Depois, uma thread exclusiva assume o recv() bloqueante.
-        # ============================================================
-        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        connection.settimeout(timeout)
-        connection.connect((self.host, self.port))
-        connection.settimeout(None)
-        self._socket = connection
-        self._receiver = threading.Thread(
-            target=self._receive_loop, daemon=True, name="server-receiver"
-        )
-        self._receiver.start()
+        proxy = self._proxy()
+        proxy._pyroTimeout = timeout
+        reply = proxy.registrar_jogador("")
+        proxy._pyroRelease()
+        if not reply.get("ok"):
+            raise ConnectionError(reply.get("message", "Não foi possível registrar jogador"))
+        self.player_id = reply["player"]
+        self.session_token = reply["token"]
+        self.events.put({"type": "CONNECTED"})
+        self.events.put({"type": "ASSIGN_PLAYER", "player": self.player_id})
+        self._emit_state(reply["state"])
+        threading.Thread(target=self._poll_loop, daemon=True, name="pyro-poll").start()
 
-    def send(self, message: dict[str, Any]) -> None:
-        # Caminho cliente -> servidor. send_message() termina a serialização
-        # chamando socket.sendall(), protegido contra envios concorrentes.
-        if self._socket is None or self._closed.is_set():
-            raise ConnectionError("Cliente não está conectado")
-        send_message(self._socket, message, self._send_lock)
+    def _emit_state(self, state: dict) -> None:
+        # A resposta de uma ação e o polling podem chegar simultaneamente.
+        # Só uma delas deve publicar cada transição de estado na fila da GUI.
+        with self._state_lock:
+            revision = state.get("revision")
+            if not isinstance(revision, int):
+                self.events.put({"type": "CONNECTION_ERROR", "message": "Estado remoto sem revisão válida"})
+                return
+            if revision <= self._last_revision:
+                return
+            self._last_state = state
+            self._last_revision = revision
+            started_now = bool(state.get("game_started")) and not self._started_seen
+            self._started_seen = self._started_seen or bool(state.get("game_started"))
+        self.events.put({"type": "START" if started_now else "STATE", **state})
 
-    def _receive_loop(self) -> None:
-        # ============================================================
-        # THREAD DE RECEPÇÃO DO CLIENTE
-        # recv() bloqueia até chegarem bytes, mas somente esta thread fica parada.
-        # Cada mensagem pronta vai para events.put(); ela NUNCA altera Tkinter.
-        #
-        # rede -> recv() -> MessageBuffer -> queue.Queue
-        #                                 -> root.after/process_queues na GUI
-        # ============================================================
-        parser = MessageBuffer()
-        assert self._socket is not None
+    def _poll_loop(self) -> None:
         try:
             while not self._closed.is_set():
-                chunk = self._socket.recv(4096)
-                if not chunk:
-                    break
-                for item in parser.feed(chunk):
-                    if isinstance(item, ProtocolError):
-                        self.events.put(
-                            {
-                                "type": "ERROR",
-                                "code": "INVALID_MESSAGE",
-                                "message": str(item),
-                            }
-                        )
-                    else:
-                        self.events.put(item)
-        except (ConnectionError, OSError) as exc:
-            if not self._closed.is_set():
-                self.events.put({"type": "CONNECTION_ERROR", "message": str(exc)})
-        finally:
-            if not self._closed.is_set():
-                self.events.put({"type": "CONNECTION_CLOSED"})
-            self.close()
+                proxy = self._proxy(); proxy._pyroTimeout = 2
+                self._emit_state(proxy.obter_estado())
+                for message in proxy.obter_mensagens(self._last_message):
+                    self._last_message = max(self._last_message, message["id"])
+                    self.events.put({"type": "CHAT", **message})
+                proxy._pyroRelease()
+                self._closed.wait(0.15)
+        except Exception as exc:
+            if not self._closed.is_set(): self.events.put({"type": "CONNECTION_ERROR", "message": str(exc)})
 
-    def close(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        if self._socket is not None:
+    def _invoke_async(
+        self, operation: str, invoke: Callable[[Pyro5.api.Proxy], dict]
+    ) -> None:
+        """Executa uma chamada RPC explícita fora da thread do Tkinter."""
+        def worker() -> None:
             try:
-                self._socket.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            self._socket.close()
+                proxy = self._proxy(); proxy._pyroTimeout = 5
+                reply = invoke(proxy)
+                proxy._pyroRelease()
+                if not reply.get("ok"): self.events.put({"type": "ERROR", **reply})
+                elif reply.get("state") is not None: self._emit_state(reply["state"])
+            except Exception as exc:
+                self.events.put({"type": "CONNECTION_ERROR", "message": str(exc)})
+        threading.Thread(target=worker, daemon=True, name=f"pyro-{operation}").start()
+
+    def move(self, origin: object, destination: object, capture: object = None) -> None:
+        if self.session_token is None: raise ConnectionError("Cliente não está conectado")
+        token = self.session_token
+        self._invoke_async("mover", lambda proxy: proxy.mover(token, origin, destination, capture))
+    def send_chat(self, message: str) -> None:
+        if self.session_token is None: raise ConnectionError("Cliente não está conectado")
+        token = self.session_token
+        self._invoke_async("enviar_mensagem", lambda proxy: proxy.enviar_mensagem(token, message))
+    def give_up(self) -> None:
+        if self.session_token is None: raise ConnectionError("Cliente não está conectado")
+        token = self.session_token
+        self._invoke_async("desistir", lambda proxy: proxy.desistir(token))
+    def close(self) -> None:
+        if self._closed.is_set(): return
+        self._closed.set()
+        if self.session_token is not None:
+            try:
+                proxy = self._proxy(); proxy._pyroTimeout = 1
+                proxy.desconectar(self.session_token); proxy._pyroRelease()
+            except Exception: pass
